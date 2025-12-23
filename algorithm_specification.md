@@ -48,15 +48,15 @@ This document defines the deterministic workflow for extracting quarterly financ
 ## 7. Output Format
 The resulting data must be consolidated into the following matrix:
 
-| Metric | Current Quarter (e.g. Sep 2025) | QoQ Quarter (e.g. Jun 2025) | YoY Quarter (e.g. Sep 2024) |
-| :--- | :--- | :--- | :--- |
-| **Sales** | [Value] | [Value] | [Value] |
-| **Expenses** | [Value] | [Value] | [Value] |
-| **Operating Profit** | [Calculated] | [Calculated] | [Calculated] |
-| **OPM %** | [Calculated] | [Calculated] | [Calculated] |
-| **Profit Before Tax** | [Value] | [Value] | [Value] |
-| **Net Profit** | [Value] | [Value] | [Value] |
-| **EPS (₹)** | [Value] | [Value] | [Value] |
+| Metric                | Current Quarter (e.g. Sep 2025) | QoQ Quarter (e.g. Jun 2025)| YoY Quarter (e.g. Sep 2024)|
+| :---                  | :---                            | :---                       | :---                       |
+| **Sales**             | [Value]                         | [Value]                    | [Value]                    |
+| **Expenses**          | [Value]                         | [Value]                    | [Value]                    |
+| **Operating Profit**  | [Calculated]                    | [Calculated]               | [Calculated]               |
+| **OPM %**             | [Calculated]                    | [Calculated]               | [Calculated]               |
+| **Profit Before Tax** | [Value]                         | [Value]                    | [Value]                    |
+| **Net Profit**        | [Value]                         | [Value]                    | [Value]                    |
+| **EPS (₹)**           | [Value]                         | [Value]                    | [Value]                    |
 
 ---
 **Standardization**: All monetary values (except EPS) must be neutralized to **Crores** based on the detected scale (Lakhs, Thousands, etc.).

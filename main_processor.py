@@ -1,6 +1,7 @@
 
 import pdfplumber
 import re
+import pandas as pd
 from pathlib import Path
 
 def normalize(s):
@@ -11,94 +12,160 @@ class FinancialReport:
         self.path = pdf_path
         self.name = Path(pdf_path).name
         self.target = "Consolidated"
-        self.scale = 1.0
         self.results = {
             "Sales": 0.0, "Expenses": 0.0, "PBT": 0.0, "PAT": 0.0, "EPS": 0.0, "OP": 0.0
         }
+        self.found_priority = {k: 99 for k in self.results.keys()}
+        self.helpers = {"Dep": 0.0, "Int": 0.0, "Other": 0.0, "TotalInc": 0.0}
 
-    def extract_numbers(self, line):
-        line = re.sub(r'(\d)\s+([,.]\d)', r'\1\2', line)
-        line = re.sub(r'(\d[,.])\s+(\d)', r'\1\2', line)
-        line = re.sub(r'\((\d[\d,.]*)\)', r'-\1', line)
-        nums = []
-        for m in re.finditer(r'-?\d[\d,.]*', line):
-            s = m.group().replace(',', '')
-            if s.count('.') > 1:
-                sp = s.split('.')
-                s = "".join(sp[:-1]) + "." + sp[-1]
-            try: nums.append(float(s))
-            except: pass
-        return nums
+    def get_rows(self, page):
+        words = page.extract_words(x_tolerance=2, y_tolerance=2)
+        if not words: return []
+        rows = {}
+        for w in words:
+            y = round(w['top'], 0)
+            found = False
+            for ry in rows.keys():
+                if abs(y - ry) < 5: rows[ry].append(w); found = True; break
+            if not found: rows[y] = [w]
+        
+        res = []
+        for y in sorted(rows.keys()):
+            r_words = sorted(rows[y], key=lambda x: x['x0'])
+            parts = []
+            if r_words:
+                c_txt, c_x0, c_x1 = r_words[0]['text'], r_words[0]['x0'], r_words[0]['x1']
+                for i in range(1, len(r_words)):
+                    w = r_words[i]
+                    if (w['x0'] - c_x1) < 4: c_txt += w['text']; c_x1 = w['x1']
+                    else: parts.append((c_txt, c_x0)); c_txt, c_x0, c_x1 = w['text'], w['x0'], w['x1']
+                parts.append((c_txt, c_x0))
+            res.append(parts)
+        return res
+
+    def parse_val(self, s):
+        s = s.replace(',', '').replace('(', '-').replace(')', '').replace("'", '').strip()
+        if not re.search(r'\d', s): return None
+        if s.count('.') > 1:
+            idx = s.rfind('.')
+            s = s[:idx].replace('.', '') + s[idx:]
+        try:
+            m = re.search(r'-?\d+\.?\d*', s)
+            return float(m.group()) if m else None
+        except: return None
 
     def parse(self):
         with pdfplumber.open(self.path) as pdf:
-            txt5 = "".join([(p.extract_text() or "") for p in pdf.pages[:min(10, len(pdf.pages))]]).lower()
-            self.target = "Consolidated" if "consolidated" in txt5 else "Standalone"
+            txt_all = "".join([p.extract_text() or "" for p in pdf.pages[:min(12, len(pdf.pages))]]).lower()
+            self.target = "Consolidated" if "consolidated" in txt_all else "Standalone"
             
-            best_p = None; max_s = -1
-            for i, page in enumerate(pdf.pages):
-                txt = (page.extract_text() or "").lower()
-                if "ended" not in txt: continue
-                score = (10 if "particulars" in txt else 0) + (5 if "revenue" in txt else 0) + \
-                        (5 if "expenses" in txt else 0) + (10 if self.target.lower() in txt else 0)
-                if score > max_s: max_s = score; best_p = page
-            
-            if not best_p: return False
-            p_txt = best_p.extract_text().lower()
-            if "lakh" in p_txt or "lakh" in txt5: self.scale = 100.0
-            elif "million" in p_txt or "million" in txt5: self.scale = 10.0
-            elif "in rs" in p_txt or "in rs" in txt5: self.scale = 10000000.0
-            
-            rows = best_p.extract_table({"vertical_strategy": "text", "horizontal_strategy": "text"})
-            if not rows: rows = [[l] for l in best_p.extract_text().split('\n')]
-            
+            # Global Scale Filter (prefer specific phrases)
+            global_scale = 1.0
+            if "crore" in txt_all: global_scale = 1.0
+            elif any(x in txt_all for x in ["lakh", "lac", "lacs"]): global_scale = 100.0
+            elif "million" in txt_all: global_scale = 10.0
+            elif "thousand" in txt_all: global_scale = 1000.0
+
             mapping = {
-                "Sales": ["totalrevenuefrom", "incomefromoperations", "netsales", "revenuefromoperations", "totalincome"],
-                "Expenses": ["totalexpenses", "totalexpenditure"],
-                "PBT": ["profitbeforetax", "profitlossbeforetax", "pbt", "profitbeforeexceptional"],
-                "PAT": ["netprofit", "profitfortheperiod", "profitaftertax", "netprofitlossfortheperiod", "profitlossfortheperiod"],
-                "EPS": ["basicearningspershare", "basiceps", "earningspershareof", "earningpershare", "basic", "eps"],
-                "Dep": ["depreciation"], "Int": ["financecost", "interestcost"], "Other": ["otherincome"]
+                "Sales": [("revenuefromoperations", 1), ("incomefromoperations", 2), ("netsales", 3)],
+                "TotalInc": [("totalincome", 1), ("totalrevenue", 1)],
+                "Expenses": [("totalexpenses", 1), ("totalexpenditure", 2)],
+                "PBT": [("profitbeforetax", 1), ("profitlossbeforetax", 2), ("pbt", 3), ("profitbeforeexceptional", 4)],
+                "PAT": [("netprofit", 1), ("profitfortheperiod", 1), ("profitaftertax", 3), ("profitfortheyear", 1)],
+                "EPS": [("basicearningspershare", 1), ("basiceps", 1), ("earningpershare", 2), ("basic", 3)],
+                "Dep": [("depreciation", 1)], "Int": [("financecost", 1), ("interestcost", 1)], "Other": [("otherincome", 1)]
             }
-            hlp = {"Dep": 0.0, "Int": 0.0, "Other": 0.0}
 
-            for r in rows:
-                if not r or not any(r): continue
-                line = " ".join([str(c) if c else "" for c in r])
-                nums = self.extract_numbers(line)
-                if not nums: continue
+            for page in pdf.pages:
+                text = page.extract_text()
+                if not text: continue
+                txt = text.lower()
+                if "ended" not in txt and "particulars" not in txt: continue
                 
-                lbl = normalize(line[:re.search(r'-?\d', line).start()])
-                for key, kws in mapping.items():
-                    if any(normalize(kw) in lbl for kw in kws):
-                        if key == "Int" and "income" in lbl: continue
-                        if key == "PAT" and any(x in lbl for x in ["comprehensive", "minority", "attributable"]): continue
-                        
-                        # ADVANCED SKIPPER: Find the first significant number
-                        val = 0.0
-                        for n in nums:
-                            # EPS can be small. Others should be larger or decimal.
-                            if key == "EPS": val = n; break
-                            if abs(n) > 50 or (n != int(n) and n != 0): val = n; break
-                        
-                        if val != 0:
-                            scaled = round(val / (1.0 if key == "EPS" else self.scale), 2)
-                            if key in hlp: hlp[key] = scaled
-                            else:
-                                if key == "EPS" and "basic" in lbl: self.results["EPS"] = scaled
-                                elif self.results.get(key if key != "PAT" else "PAT", 0) == 0:
-                                    self.results[key if key != "PAT" else "PAT"] = scaled
+                is_con = "consolidated" in txt
+                prio = 1 if is_con else (2 if "standalone" in txt else 3)
+                if self.target == "Consolidated" and prio == 2 and not is_con: continue
 
-            if self.results["OP"] == 0:
-                self.results["OP"] = round(self.results["PBT"] + hlp["Dep"] + hlp["Int"] - hlp["Other"], 2)
+                # Page-specific scale
+                page_scale = global_scale
+                scale_area = re.search(r'in\s*(lakh|lac|crore|million|rs|rupee)', txt)
+                if scale_area:
+                    skw = scale_area.group(1)
+                    if "crore" in skw: page_scale = 1.0
+                    elif "million" in skw: page_scale = 10.0
+                    elif "lakh" in skw or "lac" in skw: page_scale = 100.0
+
+                rows = self.get_rows(page)
+                anchor_x = None
+                for r in rows[:20]:
+                    for t, x in r:
+                        tl = t.lower()
+                        if ("30" in tl or "sep" in tl or "31" in tl or "mar" in tl) and "2025" in tl:
+                            if "hy" not in tl and "year" not in tl:
+                                anchor_x = x; break
+                    if anchor_x: break
+                
+                for idx, r in enumerate(rows):
+                    nums = []
+                    for t, x in r:
+                        v = self.parse_val(t)
+                        if v is not None: nums.append((v, x))
+                    
+                    # Special for Thangamayil: if line looks like it contains numbers but they are merged incorrectly
+                    # (Handled by get_rows merging already)
+
+                    r_str = " ".join([p[0] for p in r])
+                    match = re.search(r'-?\d', r_str)
+                    lbl = normalize(r_str[:match.start()]) if match else normalize(r_str)
+                    
+                    target_key = None
+                    for k, kws in mapping.items():
+                        for kw, rk in kws:
+                            if normalize(kw) in lbl:
+                                if k == "Int" and "income" in lbl: continue
+                                if k == "PAT" and any(x in lbl for x in ["comprehensive", "minority"]): continue
+                                target_key = k; break
+                        if target_key: break
+                    
+                    if target_key and nums:
+                        clean = []
+                        for i, (v, x) in enumerate(nums):
+                            if i < 2 and abs(v) < 100 and v == int(v) and x < 300 and len(nums) > 2: continue
+                            clean.append((v, x))
+                        
+                        if clean:
+                            val = clean[0][0]
+                            if anchor_x:
+                                dlist = sorted([(abs(x-anchor_x), v) for v, x in clean])
+                                if dlist[0][0] < 250: val = dlist[0][1]
+                            
+                            s_val = round(val / (1.0 if target_key == "EPS" else page_scale), 2)
+                            
+                            if target_key in ["Dep", "Int", "Other", "TotalInc"]:
+                                if self.helpers[target_key] == 0: self.helpers[target_key] = s_val
+                            else:
+                                res_k = "PAT" if target_key == "PAT" else target_key
+                                curr_prio = self.found_priority.get(res_k, 99)
+                                if prio < curr_prio or (prio == curr_prio and self.results[res_k] == 0):
+                                    self.results[res_k] = s_val
+                                    self.found_priority[res_k] = prio
+                                    if target_key == "EPS" and "basic" in lbl: self.found_priority[res_k] = 0
+
+            # Fallback for Sales
+            if self.results["Sales"] == 0 and self.helpers["TotalInc"] != 0:
+                self.results["Sales"] = round(self.helpers["TotalInc"] - self.helpers["Other"], 2)
+            
+            # OP Calculation
+            if self.results["Sales"] != 0:
+                self.results["OP"] = round(self.results["PBT"] + self.helpers["Dep"] + self.helpers["Int"] - self.helpers["Other"], 2)
+            
             return True
 
 if __name__ == "__main__":
     import os
-    docs = sorted([f for f in os.listdir("docs") if f.endswith(".pdf")])
-    for d in docs:
+    for d in sorted([f for f in os.listdir("docs") if f.endswith(".pdf")]):
         rep = FinancialReport(os.path.join("docs", d))
-        if rep.parse():
-            print(f"\n>>>> {rep.name} ({rep.target})")
-            for m in ["Sales", "Expenses", "OP", "PBT", "PAT", "EPS"]:
-                print(f"{m:<10}: {rep.results[m]:>12,.2f}")
+        rep.parse()
+        print(f"\n>>>> {rep.name}")
+        for m in ["Sales", "Expenses", "PBT", "PAT", "EPS"]:
+            print(f"{m:<10}: {rep.results[m]:>12,.2f}")
