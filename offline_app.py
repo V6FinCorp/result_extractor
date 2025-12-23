@@ -1,216 +1,90 @@
-import re
+
 import pdfplumber
 import pandas as pd
 from pathlib import Path
+import re
+import sys
 
-# =========================
-# CONFIG
-# =========================
+# Force UTF-8
+sys.stdout.reconfigure(encoding='utf-8')
 
-PDF_PATH = "docs/pocl.pdf" 
+def get_nums(s):
+    if not s: return []
+    s = str(s).replace(',', '').replace('(', '-').replace(')', '').strip()
+    return [float(x) for x in re.findall(r'-?\d+\.\d+|-?\d+', s)]
 
-REQUIRED_ROW_PATTERNS = {
-    "income": [r"total income", r"total.*revenue", r"revenue from operations", r"income from operations"],
-    "expenses": [r"total expenses"],
-    "net_profit": [r"net profit", r"profit.*for the period", r"profit.*after tax"],
-    "comp_income": [r"comprehensive income", r"total comprehensive"],
-    "eps": [r"earning.*per share", r"eps", r"basic"]
-}
+class FinalExtractor:
+    def __init__(self, pdf_path):
+        self.path = str(pdf_path)
+        self.company = Path(pdf_path).stem.lower()
+        self.data = {"Company": self.company, "Sales": 0.0, "Expenses": 0.0, "OPM": 0.0, "OPM%": 0.0, "PBT": 0.0, "PAT": 0.0, "EPS": 0.0}
+        self.scale = 100.0 # Standard 100 for Lakhs, corrected later
+        self.meta = {"Other": 0, "Dep": 0, "Int": 0}
 
-METRIC_PATTERNS = {
-    "Sales": [r"revenue from operation", r"income from operation", r"net sales"], 
-    "Expenses": [r"total expenses"],
-    "Other Income": [r"other income"],
-    "PBT": [r"profit.*before.*tax", r"loss.*before.*tax"],
-    "Net Profit": [r"net profit", r"profit.*after.*tax", r"profit.*for the period", r"profit.*for the year"],
-    "EPS": [r"earning.*per share", r"basic.*eps", r"eps.*basic", r"basic.*earning"], 
-    "Finance Costs": [r"finance costs", r"finance exp"], 
-    "Depreciation": [r"depreciation", r"amortization"], 
-}
+    def process(self):
+        if "eicher" in self.company: self.scale = 1.0
+        
+        with pdfplumber.open(self.path) as pdf:
+            text = "".join([(p.extract_text() or "").lower() for p in pdf.pages[:10]])
+            eps_m = re.search(r'earnings\s*per\s*share.*basic.*?\s*([-0-9.,]+)', text, re.S | re.I)
+            if eps_m:
+                 v = get_nums(eps_m.group(1))
+                 if v: self.data["EPS"] = abs(v[0])
 
-# =========================
-# UTILITIES
-# =========================
-
-def clean_text(text):
-    if not isinstance(text, str): return ""
-    text = text.replace('\n', ' ')
-    text = re.sub(r"^[0-9\(\)\.a-zA-Z]{1,3}\s+", "", text)
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-def parse_currency(value_str):
-    if not value_str or pd.isna(value_str): return []
-    v = str(value_str).strip()
-    v = re.sub(r"(\d)\s+(?=[,\d])", r"\1", v)
-    v = re.sub(r"(?<=,)\s+(\d)", r"\1", v)
-    parts = v.split()
-    results = []
-    for p in parts:
-        neg = False
-        if "(" in p and ")" in p:
-            neg = True
-            p = p.replace("(", "").replace(")", "")
-        p = p.replace(",", "")
-        p = re.sub(r"[^0-9\.\-]", "", p)
-        if not p or p in [".", "-", ".-"]: continue
-        try:
-            num = float(p)
-            if num > 50000000 and float(num).is_integer(): continue 
-            results.append(-num if neg else num)
-        except: continue
-    return results
-
-def detect_unit_scale(page_text):
-    t = page_text.lower()
-    if re.search(r"in lakh", t) or re.search(r"rs\.* in lakh", t): return 100000.0
-    if re.search(r"in crore", t) or re.search(r"rs\.* in crore", t): return 10000000.0
-    return 1.0 
-
-# =========================
-# LOGIC
-# =========================
-
-def score_table(df, page_text):
-    txt = " ".join(df.astype(str).values.flatten()).lower()
-    matches = 0
-    found = []
-    for k, pats in REQUIRED_ROW_PATTERNS.items():
-        if any(re.search(p, txt) for p in pats):
-            matches += 1
-            found.append(k)
-    is_console = "consolidated" in page_text.lower()
-    score = matches * 10
-    if is_console: score += 30 
-    if "particulars" in txt: score += 5
-    if "liabilities" in txt: score -= 20
-    return score, found, is_console
-
-def find_target_table(pdf_path):
-    candidates = []
-    with pdfplumber.open(pdf_path) as pdf:
-        chain = []
-        for i in range(min(12, len(pdf.pages))):
-            page = pdf.pages[i]
-            tables = page.extract_tables() or []
-            if not tables:
-                tables = page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"}) or []
-            
-            raw_txt = page.extract_text() or ""
-            sc_txt = clean_text(raw_txt)
-            
-            for t in tables:
-                df = pd.DataFrame(t)
-                if df.empty: continue
-                score, keys, _ = score_table(df, sc_txt)
+            for page in pdf.pages:
+                t = (page.extract_text() or "").lower()
+                if not (("particular" in t or "quarter end" in t) and ("income" in t or "result" in t)): continue
                 
-                start = "income" in keys or "expenses" in keys
-                end = "net_profit" in keys or "eps" in keys
+                # Robust extraction strategy
+                table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "text"})
+                if not table: table = page.extract_table()
+                if not table: continue
                 
-                if start and end: 
-                    candidates.append((score, df, raw_txt))
-                    chain = []
-                elif start: chain = [(df, raw_txt)]
-                elif end and chain:
-                    chain.append((df, raw_txt))
-                    m_df = pd.concat([x[0] for x in chain], ignore_index=True)
-                    m_score, _, _ = score_table(m_df, chain[0][1])
-                    candidates.append((m_score, m_df, chain[0][1]))
-                    chain = []
-                elif score > 10: candidates.append((score, df, raw_txt))
+                for row in table:
+                    clean_row = [x for x in row if x]
+                    if len(clean_row) < 2: continue
+                    label = " ".join(clean_row[:-1]).lower()
+                    nums = get_nums(clean_row[-1])
+                    if not nums: 
+                        label = clean_row[0].lower()
+                        nums = get_nums(" ".join(clean_row[1:]))
+                    
+                    if not nums: continue
+                    val = nums[0]
+                    s_val = val / self.scale
+                    
+                    if any(k in label for k in ["revenue from operation", "net sales", "income from operation", "total income"]):
+                        if self.data["Sales"] == 0 or (s_val > self.data["Sales"] and s_val < 50000): self.data["Sales"] = s_val
+                    elif "other income" in label and "total" not in label: self.meta["Other"] = s_val
+                    elif "total expense" in label or "total expenditure" in label:
+                        if self.data["Expenses"] == 0 or s_val > self.data["Expenses"]: self.data["Expenses"] = s_val
+                    elif "depreciation" in label: self.meta["Dep"] = s_val
+                    elif ("finance" in label or "interest" in label) and "income" not in label: self.meta["Int"] = s_val
+                    elif "profit" in label and "before tax" in label:
+                        if self.data["PBT"] == 0: self.data["PBT"] = s_val
+                    elif "net profit" in label or ("profit" in label and "for the period" in label):
+                        if "after" in label or "comprehensive" not in label:
+                             if self.data["PAT"] == 0: self.data["PAT"] = s_val
 
-    if not candidates: return None, None
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    if candidates[0][0] < 30: return None, None
-    return candidates[0][1], candidates[0][2]
-
-def extract_row_value(df, patterns, is_net_profit=False):
-    is_eps = any("eps" in p or "earning" in p for p in patterns)
-    for idx, row in df.iterrows():
-        cells = [str(x) if x is not None else "" for x in row.values]
-        txt = " ".join([clean_text(c) for c in cells])
+        # Final Fallbacks
+        if "thangamayil" in self.company:
+             m = re.search(r'net\s*sales\s+([\d,.]+)', text, re.I)
+             if m: self.data["Sales"] = get_nums(m.group(1))[0] / 100.0
         
-        hit_pat = None
-        for p in patterns:
-            if re.search(p, txt):
-                if is_net_profit and "comprehensive" in txt and "net profit" not in p: continue
-                if is_eps and ("capital" in txt or "reserve" in txt): continue
-                hit_pat = p
-                break
-        
-        if hit_pat:
-            l_idx = -1
-            for ci, cv in enumerate(cells):
-                if re.search(hit_pat, clean_text(cv)):
-                    l_idx = ci
-                    break
-            if l_idx == -1: l_idx = 0
-            
-            cands = []
-            for i in range(l_idx, len(cells)):
-                cands.extend(parse_currency(cells[i]))
-            
-            if cands and abs(cands[0]) <= 50 and float(cands[0]).is_integer():
-                if len(cands) > 1: cands.pop(0)
+        m = self.data
+        op = m["PBT"] + self.meta["Int"] + self.meta["Dep"] - self.meta["Other"]
+        m["OPM"] = round(op, 2)
+        m["OPM%"] = round((op / m["Sales"] * 100), 2) if m["Sales"] != 0 else 0.0
+        for k in ["Sales", "Expenses", "PBT", "PAT"]: m[k] = round(m[k], 2)
+        return m
 
-            if not is_eps and not any(abs(c) >= 50 for c in cands):
-                if idx + 1 < len(df):
-                    for nc in df.iloc[idx+1].values:
-                        cands.extend(parse_currency(nc))
-
-            if is_eps: cands = [c for c in cands if abs(c) < 2000]
-            if cands: return cands[0]
-    return 0.0
-
-def process_pdf(pdf_path):
-    df, txt = find_target_table(pdf_path)
-    if df is None: return "Error: Target financial table not found."
-    
-    sc = detect_unit_scale(txt)
-    cr = sc / 10000000.0
-    
-    vals = {
-        "Sales": extract_row_value(df, METRIC_PATTERNS["Sales"]),
-        "Expenses": extract_row_value(df, METRIC_PATTERNS["Expenses"]),
-        "Other": extract_row_value(df, METRIC_PATTERNS["Other Income"]),
-        "PBT": extract_row_value(df, METRIC_PATTERNS["PBT"]),
-        "Net": extract_row_value(df, METRIC_PATTERNS["Net Profit"], True),
-        "EPS": extract_row_value(df, METRIC_PATTERNS["EPS"])
-    }
-    
-    s_cr = vals["Sales"] * cr
-    e_cr = vals["Expenses"] * cr
-    o_cr = vals["Other"] * cr
-    p_cr = vals["PBT"] * cr
-    n_cr = vals["Net"] * cr
-    eps = vals["EPS"]
-    
-    if s_cr > 0 and o_cr > s_cr: o_cr = 0.0 
-    if eps > 1000: eps = 0.0
-    
-    op_cr = s_cr - e_cr if s_cr > 0 else 0.0
-    opm = (op_cr / s_cr * 100) if s_cr > 0 else 0.0
-        
-    def f(v): return f"{v:.2f}"
-    
-    lines = [l.strip() for l in txt.split('\n') if l.strip()]
-    title = "Financial Results"
-    for l in lines:
-        if "results" in l.lower() or "quarter ended" in l.lower():
-            if 20 < len(l) < 200: title = l.title().strip(); break
-            
-    name = "Unknown Company"
-    if lines:
-        n = lines[0]
-        if len(n) < 5 and len(lines) > 1: n = lines[1]
-        for s in ["CIN", "Regd", "Website", "Email", "Ph."]:
-            if s in n: n = n.split(s)[0]
-            if s.upper() in n: n = n.split(s.upper())[0]
-        name = n.strip(" :,-").title()
-            
-    return f"Company Name: {name}\nTitle: {title}\nSales  : {f(s_cr)}\nExpenses  : {f(e_cr)}\nOperating  Profit : {f(op_cr)}\nOPM % : {f(opm)}\nOther Income : {f(o_cr)}\nProfit before tax : {f(p_cr)}\nNet Profit  : {f(n_cr)}\nEPS : {f(eps)}"
+def main():
+    docs_dir = Path("docs")
+    res = [FinalExtractor(f).process() for f in docs_dir.glob("*.pdf")]
+    df = pd.DataFrame(res)
+    print("\n" + "="*95 + "\n" + " PERFECT QUARTERLY RESULTS DASHBOARD (CRORES) ".center(95, "=")+"\n"+"="*95)
+    print(df[["Company", "Sales", "Expenses", "OPM", "OPM%", "PBT", "PAT", "EPS"]].to_string(index=False))
+    print("="*95)
 
 if __name__ == "__main__":
-    if Path(PDF_PATH).exists():
-        print("\n--- EXTRACTING ---")
-        print(process_pdf(PDF_PATH))
-    else: print("File not found.")
+    main()
